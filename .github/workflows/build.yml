@@ -1,0 +1,581 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-binary-cache
+
+    steps:
+      - name: Runner diagnostics
+        run: |
+          Write-Host "=== Runner ==="
+          Write-Host "OS: $env:OS"
+          Write-Host "Runner image: $env:ImageVersion"
+          Write-Host "Architecture: $env:PROCESSOR_ARCHITECTURE"
+          Write-Host ""
+          Write-Host "=== Tools ==="
+          cmake --version
+          ninja --version 2>$null
+          git --version
+          Write-Host "Ruby: $(ruby --version 2>$null)"
+          Write-Host ""
+          Write-Host "=== MSVC ==="
+          Write-Host "Visual Studio: $((Get-VSSetupInstance).InstallationVersion 2>$null)"
+          Write-Host ""
+          Write-Host "=== vcpkg ==="
+          vcpkg version 2>$null
+          Write-Host "VCPKG_ROOT: $env:VCPKG_INSTALLATION_ROOT"
+
+      - name: Set artifact suffix
+        run: echo "ARTIFACT_SUFFIX=$("${{ github.ref_name }}" -replace '/', '-')" >> $env:GITHUB_ENV
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up sccache
+        id: sccache-windows
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          variant: sccache
+          key: windows
+          append-timestamp: false
+
+      - name: Compiler cache status
+        run: |
+          echo "Exact hit: ${{ steps.sccache-windows.outputs.cache-hit }}"
+          echo "Restored: ${{ steps.sccache-windows.outputs.cache-matched-key }}"
+
+      - name: Install asciidoctor
+        run: gem install asciidoctor
+
+      - name: Create vcpkg binary cache directory
+        run: New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/vcpkg-binary-cache"
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache-windows
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ github.workspace }}/vcpkg-binary-cache
+          key: vcpkg-binary-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-binary-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-
+            vcpkg-binary-x64-windows-
+
+      - name: Cache status
+        run: |
+          echo "Key: vcpkg-binary-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}"
+          echo "Exact hit: ${{ steps.vcpkg-cache-windows.outputs.cache-hit }}"
+          echo "Restored: ${{ steps.vcpkg-cache-windows.outputs.cache-matched-key }}"
+
+      - name: Configure CMake
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DWITH_XC_ALL=ON
+          -DWITH_TESTS=ON
+          -DX_VCPKG_APPLOCAL_DEPS_INSTALL=ON
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run tests
+        id: tests-windows
+        working-directory: build
+        shell: bash
+        env:
+          QT_FORCE_STDERR_LOGGING: '1'
+          QT_ASSUME_STDERR_HAS_CONSOLE: '1'
+          CTEST_OUTPUT_ON_FAILURE: '1'
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          BRANCH="${GITHUB_REF_NAME//\//-}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          LOGFILE="test-log-windows-${BRANCH}-${SHORT_SHA}-${TIMESTAMP}.txt"
+          echo "logfile=$LOGFILE" >> "$GITHUB_OUTPUT"
+          ctest --extra-verbose --output-on-failure --test-output-size-failed 0 --output-log "$LOGFILE"
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.tests-windows.outputs.logfile }}
+          path: build/${{ steps.tests-windows.outputs.logfile }}
+
+      - name: Upload CTest internal log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-lasttest-windows
+          path: build/Testing/Temporary/LastTest.log
+
+      - name: Package ZIP
+        working-directory: build
+        run: cpack -G ZIP
+
+      - name: Package MSI
+        working-directory: build
+        run: cpack -G WIX
+
+      - name: Print WiX log on failure
+        if: failure()
+        working-directory: build
+        run: Get-Content _CPack_Packages/win64/WIX/wix.log -ErrorAction SilentlyContinue
+
+      - name: Upload Portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: KeePassXC-Win64-Portable-${{ env.ARTIFACT_SUFFIX }}
+          path: build/*.zip
+          retention-days: 7
+
+      - name: Upload MSI Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: KeePassXC-Win64-MSI-${{ env.ARTIFACT_SUFFIX }}
+          path: build/*.msi
+          retention-days: 7
+
+      - name: Save vcpkg binary cache
+        if: "!cancelled() && steps.vcpkg-cache-windows.outputs.cache-hit != 'true'"
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ github.workspace }}/vcpkg-binary-cache
+          key: vcpkg-binary-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Runner diagnostics
+        run: |
+          echo "=== Runner ==="
+          echo "Image: $ImageVersion"
+          uname -a
+          lsb_release -a 2>/dev/null || cat /etc/os-release
+          echo ""
+          echo "=== Tools ==="
+          cmake --version
+          ninja --version 2>/dev/null || true
+          gcc --version | head -1
+          g++ --version | head -1
+          git --version
+          ruby --version 2>/dev/null || true
+          echo ""
+          echo "=== Environment ==="
+          echo "HOME: $HOME"
+          echo "PATH: $PATH"
+
+      - name: Set artifact suffix
+        run: echo "ARTIFACT_SUFFIX=${GITHUB_REF_NAME//\//-}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: >
+          sudo apt-get update && sudo apt-get install -y
+          build-essential cmake g++
+          qtbase5-dev qtbase5-private-dev qttools5-dev qttools5-dev-tools
+          libqt5svg5-dev libqt5x11extras5-dev
+          libargon2-dev libminizip-dev libbotan-2-dev libqrencode-dev
+          libkeyutils-dev zlib1g-dev libreadline-dev
+          libpcsclite-dev libusb-1.0-0-dev libxi-dev libxtst-dev
+          asciidoctor ninja-build
+
+      - name: Set up ccache
+        id: ccache-linux
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: linux
+          append-timestamp: false
+
+      - name: Compiler cache status
+        run: |
+          echo "Exact hit: ${{ steps.ccache-linux.outputs.cache-hit }}"
+          echo "Restored: ${{ steps.ccache-linux.outputs.cache-matched-key }}"
+
+      - name: Configure CMake
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DWITH_XC_ALL=ON
+          -DWITH_TESTS=ON
+          -DWITH_CCACHE=ON
+          -DKEEPASSXC_DIST_TYPE=AppImage
+          -DCMAKE_INSTALL_PREFIX=/usr
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run tests
+        id: tests-linux
+        working-directory: build
+        env:
+          QT_QPA_PLATFORM: offscreen
+          CTEST_OUTPUT_ON_FAILURE: '1'
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          BRANCH="${GITHUB_REF_NAME//\//-}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          LOGFILE="test-log-linux-${BRANCH}-${SHORT_SHA}-${TIMESTAMP}.txt"
+          echo "logfile=$LOGFILE" >> "$GITHUB_OUTPUT"
+          ctest --extra-verbose --output-on-failure --test-output-size-failed 0 2>&1 | tee "$LOGFILE"
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.tests-linux.outputs.logfile }}
+          path: build/${{ steps.tests-linux.outputs.logfile }}
+
+      - name: Upload CTest internal log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-lasttest-linux
+          path: build/Testing/Temporary/LastTest.log
+
+      - name: Install to AppDir
+        run: cmake --install build --strip --prefix "$(pwd)/build/AppDir/usr"
+
+      - name: Download linuxdeploy
+        run: |
+          DEPLOY_DIR="$(pwd)/build/deploy-tools"
+          mkdir -p "$DEPLOY_DIR"
+          curl -L -o "$DEPLOY_DIR/linuxdeploy-x86_64.AppImage" \
+            "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+          curl -L -o "$DEPLOY_DIR/linuxdeploy-plugin-qt-x86_64.AppImage" \
+            "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage"
+          curl -L -o "$DEPLOY_DIR/linuxdeploy-plugin-appimage-x86_64.AppImage" \
+            "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage"
+          chmod +x "$DEPLOY_DIR"/*.AppImage
+
+      - name: Create AppImage
+        run: |
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export PATH="$(pwd)/build/deploy-tools:$PATH"
+          APPDIR="$(pwd)/build/AppDir"
+          linuxdeploy-x86_64.AppImage \
+            --appdir "$APPDIR" \
+            --plugin qt \
+            --custom-apprun "share/linux/appimage-apprun.sh" \
+            --desktop-file "$APPDIR/usr/share/applications/org.keepassxc.KeePassXC.desktop" \
+            --icon-file "$APPDIR/usr/share/icons/hicolor/256x256/apps/keepassxc.png" \
+            --executable "$APPDIR/usr/bin/keepassxc" \
+            --executable "$APPDIR/usr/bin/keepassxc-cli" \
+            --executable "$APPDIR/usr/bin/keepassxc-proxy" \
+            --output appimage
+
+      - name: Create TGZ tarball
+        run: |
+          INSTALL_DIR="$(pwd)/build/install"
+          cmake --install build --strip --prefix "$INSTALL_DIR/KeePassXC"
+          tar -czf "build/KeePassXC-Linux.tar.gz" -C "$INSTALL_DIR" KeePassXC
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v7
+        with:
+          name: KeePassXC-Linux-x86_64-AppImage-${{ env.ARTIFACT_SUFFIX }}
+          path: KeePassXC-*.AppImage
+          retention-days: 7
+
+      - name: Upload TGZ tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: KeePassXC-Linux-x86_64-Tarball-${{ env.ARTIFACT_SUFFIX }}
+          path: build/KeePassXC-Linux.tar.gz
+          retention-days: 7
+
+  macos-arm64:
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-binary-cache
+
+    steps:
+      - name: Runner diagnostics
+        run: |
+          echo "=== Runner ==="
+          echo "Image: $ImageVersion"
+          uname -a
+          sw_vers
+          echo ""
+          echo "=== Tools ==="
+          cmake --version
+          ninja --version 2>/dev/null || true
+          clang --version | head -3
+          git --version
+          ruby --version 2>/dev/null || true
+          echo ""
+          echo "=== Xcode ==="
+          xcodebuild -version
+          xcrun --show-sdk-path
+          echo ""
+          echo "=== vcpkg ==="
+          vcpkg version 2>/dev/null || true
+          echo "VCPKG_ROOT: $VCPKG_INSTALLATION_ROOT"
+          echo ""
+          echo "=== Homebrew ==="
+          brew --version
+          echo "libpng: $(brew list --versions libpng 2>/dev/null || echo 'not installed')"
+
+      - name: Set artifact suffix
+        run: echo "ARTIFACT_SUFFIX=${GITHUB_REF_NAME//\//-}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: brew install ninja autoconf autoconf-archive automake libtool
+
+      - name: Set up ccache
+        id: ccache-macos-arm64
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: macos-arm64
+          append-timestamp: false
+
+      - name: Compiler cache status
+        run: |
+          echo "Exact hit: ${{ steps.ccache-macos-arm64.outputs.cache-hit }}"
+          echo "Restored: ${{ steps.ccache-macos-arm64.outputs.cache-matched-key }}"
+
+      - name: Install asciidoctor
+        run: gem install asciidoctor
+
+      - name: Create vcpkg binary cache directory
+        run: mkdir -p "${{ github.workspace }}/vcpkg-binary-cache"
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache-macos-arm64
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ github.workspace }}/vcpkg-binary-cache
+          key: vcpkg-binary-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-binary-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-
+            vcpkg-binary-arm64-osx-
+
+      - name: Cache status
+        run: |
+          echo "Key: vcpkg-binary-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}"
+          echo "Exact hit: ${{ steps.vcpkg-cache-macos-arm64.outputs.cache-hit }}"
+          echo "Restored: ${{ steps.vcpkg-cache-macos-arm64.outputs.cache-matched-key }}"
+
+      - name: Configure CMake
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=arm64-osx-dynamic-release
+          -DWITH_XC_ALL=ON
+          -DWITH_TESTS=ON
+          -DWITH_CCACHE=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run tests
+        id: tests-macos-arm64
+        working-directory: build
+        env:
+          CTEST_OUTPUT_ON_FAILURE: '1'
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          BRANCH="${GITHUB_REF_NAME//\//-}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          LOGFILE="test-log-macos-arm64-${BRANCH}-${SHORT_SHA}-${TIMESTAMP}.txt"
+          echo "logfile=$LOGFILE" >> "$GITHUB_OUTPUT"
+          ctest --extra-verbose --output-on-failure --test-output-size-failed 0 2>&1 | tee "$LOGFILE"
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.tests-macos-arm64.outputs.logfile }}
+          path: build/${{ steps.tests-macos-arm64.outputs.logfile }}
+
+      - name: Upload CTest internal log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-lasttest-macos-arm64
+          path: build/Testing/Temporary/LastTest.log
+
+      - name: Install
+        run: cmake --install build --prefix build/install
+
+      - name: Package DMG
+        working-directory: build
+        run: cpack -G DragNDrop
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: KeePassXC-macOS-ARM64-DMG-${{ env.ARTIFACT_SUFFIX }}
+          path: build/*.dmg
+          retention-days: 7
+
+      - name: Save vcpkg binary cache
+        if: "!cancelled() && steps.vcpkg-cache-macos-arm64.outputs.cache-hit != 'true'"
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ github.workspace }}/vcpkg-binary-cache
+          key: vcpkg-binary-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
+  macos-x64:
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-binary-cache
+
+    steps:
+      - name: Runner diagnostics
+        run: |
+          echo "=== Runner ==="
+          echo "Image: $ImageVersion"
+          uname -a
+          sw_vers
+          echo ""
+          echo "=== Tools ==="
+          cmake --version
+          ninja --version 2>/dev/null || true
+          clang --version | head -3
+          git --version
+          ruby --version 2>/dev/null || true
+          echo ""
+          echo "=== Xcode ==="
+          xcodebuild -version
+          xcrun --show-sdk-path
+          echo ""
+          echo "=== vcpkg ==="
+          vcpkg version 2>/dev/null || true
+          echo "VCPKG_ROOT: $VCPKG_INSTALLATION_ROOT"
+          echo ""
+          echo "=== Homebrew ==="
+          brew --version
+          echo "libpng: $(brew list --versions libpng 2>/dev/null || echo 'not installed')"
+
+      - name: Set artifact suffix
+        run: echo "ARTIFACT_SUFFIX=${GITHUB_REF_NAME//\//-}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: brew install ninja autoconf autoconf-archive automake libtool
+
+      - name: Set up ccache
+        id: ccache-macos-x64
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: macos-x64
+          append-timestamp: false
+
+      - name: Compiler cache status
+        run: |
+          echo "Exact hit: ${{ steps.ccache-macos-x64.outputs.cache-hit }}"
+          echo "Restored: ${{ steps.ccache-macos-x64.outputs.cache-matched-key }}"
+
+      - name: Install asciidoctor
+        run: gem install asciidoctor
+
+      - name: Create vcpkg binary cache directory
+        run: mkdir -p "${{ github.workspace }}/vcpkg-binary-cache"
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache-macos-x64
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ github.workspace }}/vcpkg-binary-cache
+          key: vcpkg-binary-x64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-binary-x64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-
+            vcpkg-binary-x64-osx-
+
+      - name: Cache status
+        run: |
+          echo "Key: vcpkg-binary-x64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}"
+          echo "Exact hit: ${{ steps.vcpkg-cache-macos-x64.outputs.cache-hit }}"
+          echo "Restored: ${{ steps.vcpkg-cache-macos-x64.outputs.cache-matched-key }}"
+
+      - name: Configure CMake
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-osx-dynamic-release
+          -DWITH_XC_ALL=ON
+          -DWITH_TESTS=ON
+          -DWITH_CCACHE=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run tests
+        id: tests-macos-x64
+        working-directory: build
+        env:
+          CTEST_OUTPUT_ON_FAILURE: '1'
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          BRANCH="${GITHUB_REF_NAME//\//-}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          LOGFILE="test-log-macos-x64-${BRANCH}-${SHORT_SHA}-${TIMESTAMP}.txt"
+          echo "logfile=$LOGFILE" >> "$GITHUB_OUTPUT"
+          ctest --extra-verbose --output-on-failure --test-output-size-failed 0 2>&1 | tee "$LOGFILE"
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.tests-macos-x64.outputs.logfile }}
+          path: build/${{ steps.tests-macos-x64.outputs.logfile }}
+
+      - name: Upload CTest internal log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-lasttest-macos-x64
+          path: build/Testing/Temporary/LastTest.log
+
+      - name: Install
+        run: cmake --install build --prefix build/install
+
+      - name: Package DMG
+        working-directory: build
+        run: cpack -G DragNDrop
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: KeePassXC-macOS-x86_64-DMG-${{ env.ARTIFACT_SUFFIX }}
+          path: build/*.dmg
+          retention-days: 7
+
+      - name: Save vcpkg binary cache
+        if: "!cancelled() && steps.vcpkg-cache-macos-x64.outputs.cache-hit != 'true'"
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ github.workspace }}/vcpkg-binary-cache
+          key: vcpkg-binary-x64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
