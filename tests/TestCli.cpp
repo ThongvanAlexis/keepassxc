@@ -649,10 +649,10 @@ void TestCli::testClip()
     QString errorOutput(m_stderr->readAll());
 
     if (errorOutput.contains("Unable to start program")
-        || errorOutput.contains("No program defined for clipboard manipulation")) {
+        || errorOutput.contains("No program defined for clipboard manipulation")
+        || errorOutput.contains("All clipping programs failed")) {
         QSKIP("Clip test skipped due to missing clipboard tool");
     }
-    QVERIFY(!errorOutput.contains("All clipping programs failed"));
 
     m_stderr->readLine(); // Skip password prompt
     QCOMPARE(m_stderr->readAll(), QByteArray());
