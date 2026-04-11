@@ -285,7 +285,9 @@ void TestDatabase::testExternallyModified()
 
     QSignalSpy spyFileChanged(db.data(), &Database::databaseFileChanged);
     QVERIFY(tempFile.copyFromFile(dbFileName));
-    QTRY_COMPARE(spyFileChanged.count(), 1);
+    // QFileSystemWatcher may not fire on Windows CI; the FileWatcher
+    // falls back to periodic checksum every 30s, so allow enough time
+    QTRY_COMPARE_WITH_TIMEOUT(spyFileChanged.count(), 1, 35000);
     // the first argument of the databaseFileChanged signal (triggeredBySave) should be false
     QVERIFY(spyFileChanged.at(0).length() == 1);
     QVERIFY(spyFileChanged.at(0).at(0).type() == QVariant::Bool);
