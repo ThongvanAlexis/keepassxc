@@ -37,6 +37,9 @@ class DatabaseSettingsWidgetFdoSecrets;
 #endif
 class DatabaseSettingsWidgetMaintenance;
 class DatabaseSettingsWidgetRemote;
+#ifdef KPXC_FEATURE_NETWORK
+class DatabaseSettingsWidgetCloudSync;
+#endif
 class QTabWidget;
 
 class DatabaseSettingsDialog : public EditWidget
@@ -51,15 +54,23 @@ public:
     void load(const QSharedPointer<Database>& db);
     void showDatabaseKeySettings(int index = 0);
     void showRemoteSettings();
+#ifdef KPXC_FEATURE_NETWORK
+    void showCloudSyncSettings();
+#endif
 
 signals:
     void editFinished(bool accepted);
+#ifdef KPXC_FEATURE_NETWORK
+    void cloudSyncTriggered();
+#endif
 
 private slots:
     void save();
+    void applySettings();
     void reject();
 
 private:
+    bool saveAllSettings();
     QSharedPointer<Database> m_db;
     QPointer<DatabaseSettingsWidgetGeneral> m_generalWidget;
     QPointer<QTabWidget> m_securityTabWidget;
@@ -74,6 +85,9 @@ private:
 #endif
     QPointer<DatabaseSettingsWidgetMaintenance> m_maintenanceWidget;
     QPointer<DatabaseSettingsWidgetRemote> m_remoteWidget;
+#ifdef KPXC_FEATURE_NETWORK
+    QPointer<DatabaseSettingsWidgetCloudSync> m_cloudSyncWidget;
+#endif
 };
 
 #endif // KEEPASSXC_DATABASESETTINGSDIALOG_H
